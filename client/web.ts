@@ -133,13 +133,16 @@ function onMutations(records: Mutation[]) {
   }
 }
 
-export function installTabPips(): () => void {
-  if (typeof document === "undefined" || !document.head) return () => {};
+type PipsInstance = { stop: () => void; timer?: NodeJS.Timeout };
+const GLOBAL_KEY = "__tabAgePips";
+const GRACE_MS = 60_000;
+
+function start(): () => void {
   document.getElementById(STYLE_ID)?.remove();
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = CSS;
-  document.head.appendChild(style);
+  document.head?.appendChild(style);
   walk(document.documentElement);
   const observer = new MutationObserver(onMutations);
   observer.observe(document.documentElement, {
@@ -152,5 +155,27 @@ export function installTabPips(): () => void {
   return () => {
     observer.disconnect();
     document.getElementById(STYLE_ID)?.remove();
+  };
+}
+
+export function installTabPips(): () => void {
+  if (typeof document === "undefined" || !document.head) return () => {};
+  const g = globalThis as unknown as Record<string, PipsInstance | undefined>;
+  const prev = g[GLOBAL_KEY];
+  if (prev) {
+    clearTimeout(prev.timer);
+    prev.stop();
+  }
+  const instance: PipsInstance = { stop: start() };
+  g[GLOBAL_KEY] = instance;
+  return () => {
+    if (g[GLOBAL_KEY] !== instance) return;
+    clearTimeout(instance.timer);
+    // Keep styling through brief daemon reconnects, which dispose and reload the plugin.
+    instance.timer = setTimeout(() => {
+      if (g[GLOBAL_KEY] !== instance) return;
+      instance.stop();
+      delete g[GLOBAL_KEY];
+    }, GRACE_MS);
   };
 }
