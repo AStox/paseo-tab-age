@@ -35,12 +35,14 @@ type El = {
 type TextNode = { nodeType: number; parentElement: El | null };
 type Mutation = { type: string; target: El; addedNodes: ArrayLike<El> };
 
+declare const performance: { now(): number };
 declare const document: {
   head: { appendChild(node: unknown): void } | null;
   documentElement: El;
   getElementById(id: string): { remove(): void } | null;
-  createElement(tag: "style"): { id: string; textContent: string };
+  createElement(tag: "style"): { id: string; textContent: string; isConnected: boolean; remove(): void };
   createTreeWalker(root: El, whatToShow: number): { nextNode(): TextNode | null };
+  querySelectorAll(selector: string): ArrayLike<El>;
 };
 declare const MutationObserver: new (cb: (records: Mutation[]) => void) => {
   observe(target: El, options: unknown): void;
@@ -137,9 +139,12 @@ type PipsInstance = { stop: () => void; timer?: NodeJS.Timeout };
 const GLOBAL_KEY = "__tabAgePips";
 const GRACE_MS = 60_000;
 
-function start(): () => void {
-  document.getElementById(STYLE_ID)?.remove();
+type Report = (event: Record<string, unknown>) => void;
+const REPORT_EVERY_MS = 5000;
+
+function start(report: Report): () => void {
   const style = document.createElement("style");
+  document.getElementById(STYLE_ID)?.remove();
   style.id = STYLE_ID;
   style.textContent = CSS;
   document.head?.appendChild(style);
@@ -152,13 +157,52 @@ function start(): () => void {
     attributes: true,
     attributeFilter: ["class"],
   });
+
+  const lastReport = new Map<string, number>();
+  const note = (reason: string, details: Record<string, unknown> = {}) => {
+    const now = performance.now();
+    const last = lastReport.get(reason);
+    if (last !== undefined && now - last < REPORT_EVERY_MS) return;
+    lastReport.set(reason, now);
+    report({ reason, ...details, uptimeMs: Math.round(now) });
+  };
+  const heal = () => {
+    if (!style.isConnected) {
+      document.head?.appendChild(style);
+      note("style-missing");
+    }
+    const heads = document.querySelectorAll("[data-status-bucket]");
+    for (let i = 0; i < heads.length; i++) {
+      const walker = document.createTreeWalker(heads[i], 4);
+      const seen = new Set<El>();
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const label = node.parentElement;
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+        if (!PREFIX.test(label.textContent ?? "")) continue;
+        if (label.classList.contains(CLASS)) continue;
+        const cs = getComputedStyle(label);
+        const details = {
+          whiteSpace: cs.whiteSpace,
+          lineClamp: cs.webkitLineClamp,
+          text: (label.textContent ?? "").slice(0, 24),
+        };
+        note("class-missing", details);
+        enhance(label);
+        if (!label.classList.contains(CLASS)) note("enhance-bailed", details);
+      }
+    }
+  };
+  const interval = setInterval(heal, 1000);
+
   return () => {
+    clearInterval(interval);
     observer.disconnect();
-    document.getElementById(STYLE_ID)?.remove();
+    style.remove();
   };
 }
 
-export function installTabPips(): () => void {
+export function installTabPips(report: Report): () => void {
   if (typeof document === "undefined" || !document.head) return () => {};
   const g = globalThis as unknown as Record<string, PipsInstance | undefined>;
   const prev = g[GLOBAL_KEY];
@@ -166,7 +210,7 @@ export function installTabPips(): () => void {
     clearTimeout(prev.timer);
     prev.stop();
   }
-  const instance: PipsInstance = { stop: start() };
+  const instance: PipsInstance = { stop: start(report) };
   g[GLOBAL_KEY] = instance;
   return () => {
     if (g[GLOBAL_KEY] !== instance) return;
